@@ -1,0 +1,982 @@
+# Copyright (c) 2025 Ye Liu. Licensed under the BSD-3-Clause License.
+# Modified in 2026 to support active-evidence reasoning experiments.
+
+import argparse
+import copy
+import json
+import hashlib
+from contextlib import nullcontext, contextmanager
+from typing import Any, Dict, List, Optional, Sequence, Tuple
+
+import nncore
+import torch
+
+from videomind.constants import (FEEDBACK_PROMPT, GROUNDER_PROMPT,
+                                 MULTI_SEGMENT_ANSWER_PROMPT,
+                                 PLANNER_PROMPT, REVERSE_QUESTION_PROMPT,
+                                 VERIFIER_PROMPT)
+from videomind.dataset.hybrid import DATASETS
+from videomind.dataset.utils import process_vision_info
+from videomind.model.builder import build_model
+from videomind.utils.active_evidence import (
+    clamp_span, combine_candidate_score, combine_sufficiency_score,
+    expand_segments, expand_segments_directional, expand_span, heuristic_feedback_label,
+    infer_temporal_preference, minmax_normalize, parse_feedback_label,
+    resolve_active_variant, resolve_answer_text, resolve_selection_rule,
+    round_segments, round_span, segment_diversity, span_iou, token_f1_overlap,
+    union_span)
+from videomind.utils.io import get_duration, load_subtitle
+from videomind.utils.parser import parse_query, parse_span
+
+
+@contextmanager
+def resolve_infer_context(context, model, where="infer_auto"):
+    cm = None
+    entered = False
+    try:
+        cm = context()
+        cm.__enter__()
+        entered = True
+    except Exception as e:
+        print(f"[WARN] context enter failed in {where}: {type(e).__name__}: {e}; fallback to current adapters")
+    try:
+        yield
+    finally:
+        if entered and cm is not None:
+            try:
+                cm.__exit__(None, None, None)
+            except Exception as e:
+                print(f"[WARN] context exit failed in {where}: {type(e).__name__}: {e}")
+
+
+def parse_args():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--dataset')
+    parser.add_argument('--pred_path')
+    parser.add_argument('--model_gnd_path')
+    parser.add_argument('--model_ver_path')
+    parser.add_argument('--model_pla_path')
+    parser.add_argument('--model_ans_path')
+    parser.add_argument('--split', default='test', choices=['train', 'valid', 'test'])
+    parser.add_argument('--style', default='mcq', choices=['mcq', 'options', 'direct'])
+    parser.add_argument('--use_subtitle', action='store_true')
+    parser.add_argument('--auto_rephrasing', action='store_true')
+    parser.add_argument('--auto_planning', action='store_true')
+    parser.add_argument('--num_threads', type=int, default=1)
+    parser.add_argument('--device', default='auto')
+    parser.add_argument('--chunk', type=int, default=1)
+    parser.add_argument('--index', type=int, default=0)
+
+    # Active-evidence reasoning controls.
+    parser.add_argument('--active_variant', default=None,
+                        choices=['baseline', 'es_only', 'es_fa', 'es_fa_ea', 'full'])
+    parser.add_argument('--feedback_variant', default=None,
+                        choices=['baseline', 'qr_only', 'qr_oa', 'qr_oa_br', 'full'])
+    parser.add_argument('--max_rounds', type=int, default=2)
+    parser.add_argument('--sufficiency_threshold', type=float, default=0.40)
+    parser.add_argument('--overlap_threshold', type=float, default=None)
+    parser.add_argument('--boundary_expand_ratio', type=float, default=0.08)
+    parser.add_argument('--selection_rule', default=None,
+                        choices=['last', 'first_sufficient', 'first_accepted',
+                                 'best_faithfulness', 'best_overlap'])
+    parser.add_argument('--save_round_details', action='store_true')
+
+    # New lightweight policy controls.
+    parser.add_argument('--candidate_pool_size', type=int, default=1)
+    parser.add_argument('--score_alpha', type=float, default=0.5,
+                        help='weight for grounder score when building candidate pool')
+    parser.add_argument('--sufficiency_beta', type=float, default=0.20,
+                        help='weight for faithfulness score when computing final sufficiency')
+    parser.add_argument('--pair_diversity_weight', type=float, default=0.35)
+    parser.add_argument('--disable_pair_fallback_union', action='store_true')
+    parser.add_argument('--switch_diversity_weight', type=float, default=0.20)
+    parser.add_argument('--switch_penalty_same_source', type=float, default=0.15)
+    parser.add_argument('--pair_score_margin', type=float, default=0.02)
+    parser.add_argument('--expand_secondary_ratio', type=float, default=0.5,
+                        help='secondary expansion ratio for multi-segment evidence states')
+
+    parser.add_argument('--acceptance_margin', type=float, default=0.18,
+                        help='accept answers whose sufficiency score is close enough to the threshold')
+    parser.add_argument('--verifier_accept_threshold', type=float, default=0.40,
+                        help='accept directly when verifier confidence is already strong')
+    parser.add_argument('--verifier_skip_reverse_threshold', type=float, default=0.38,
+                        help='skip reverse-question generation when verifier confidence is already high')
+    parser.add_argument('--min_feedback_gap', type=float, default=0.22,
+                        help='require a clear insufficiency gap before triggering evidence feedback')
+    parser.add_argument('--feedback_verifier_floor', type=float, default=0.30,
+                        help='avoid feedback if verifier confidence is still comfortably above this floor')
+    parser.add_argument('--sufficiency_eval_rounds', type=int, default=1,
+                        help='only compute reverse-question sufficiency in the first N rounds')
+    parser.add_argument('--feedback_budget_ratio', type=float, default=0.18,
+                        help='hard upper budget for samples allowed to enter feedback; 0.18 keeps feedback below about 20%')
+    parser.add_argument('--force_low_feedback', action='store_true', default=True,
+                        help='use strict low-feedback gating: feedback only for budget-allowed clearly low-confidence samples')
+
+    parser.add_argument('--planner_max_pixels', type=int, default=20 * 28 * 28)
+    parser.add_argument('--planner_max_frames', type=int, default=20)
+    parser.add_argument('--planner_fps', type=float, default=0.5)
+
+    parser.add_argument('--grounder_max_pixels', type=int, default=48 * 28 * 28)
+    parser.add_argument('--grounder_max_frames', type=int, default=48)
+    parser.add_argument('--grounder_fps', type=float, default=0.5)
+
+    parser.add_argument('--verifier_topk', type=int, default=3)
+    parser.add_argument('--verifier_max_pixels', type=int, default=48 * 28 * 28)
+    parser.add_argument('--verifier_max_frames', type=int, default=24)
+    parser.add_argument('--verifier_fps', type=float, default=1.0)
+
+    args = parser.parse_args()
+    if args.overlap_threshold is not None:
+        args.sufficiency_threshold = args.overlap_threshold
+    if args.active_variant is None and args.feedback_variant is None:
+        args.active_variant = 'baseline'
+    return args
+
+
+def activate_role(model, role):
+    base = getattr(model, 'base_model', None)
+    available = set()
+    if hasattr(model, 'peft_config') and model.peft_config is not None:
+        try:
+            available.update(model.peft_config.keys())
+        except Exception:
+            pass
+    if base is not None and hasattr(base, 'peft_config') and base.peft_config is not None:
+        try:
+            available.update(base.peft_config.keys())
+        except Exception:
+            pass
+
+    if role in {'grounder', 'answerer'} and role not in available:
+        if hasattr(model, 'disable_adapters'):
+            model.disable_adapters()
+            return
+        if base is not None and hasattr(base, 'disable_adapters'):
+            base.disable_adapters()
+            return
+        return
+
+    if hasattr(model, 'set_adapter'):
+        model.set_adapter(role)
+        return
+    if base is not None and hasattr(base, 'set_adapter'):
+        base.set_adapter(role)
+        return
+    raise AttributeError(f"Cannot activate role={role!r}; available adapters={sorted(available) if available else 'unknown'}")
+
+
+def decode_generation(model, processor, data, max_new_tokens: int = 256) -> str:
+    output_ids = model.generate(
+        **data,
+        do_sample=False,
+        temperature=None,
+        top_p=None,
+        top_k=None,
+        repetition_penalty=None,
+        max_new_tokens=max_new_tokens)
+    assert data.input_ids.size(0) == output_ids.size(0) == 1
+    output_ids = output_ids[0, data.input_ids.size(1):]
+    if len(output_ids) > 0 and output_ids[-1] == processor.tokenizer.eos_token_id:
+        output_ids = output_ids[:-1]
+    return processor.decode(output_ids, clean_up_tokenization_spaces=False)
+
+
+def build_answer_prompt(question: str, options: Optional[Sequence[str]], style: str) -> str:
+    if options is None:
+        return question
+    if style in ('mcq', 'options'):
+        prompt = question + '\nOptions:'
+        for idx, opt in enumerate(options):
+            opt = str(opt)
+            prompt += f"\n({chr(ord('A') + idx)}) {opt[0].upper() + opt[1:]}"
+        prompt += '\nPlease only give the best option.'
+        return prompt
+    return question
+
+
+def maybe_add_subtitles(prompt: str, anno: Dict, seg: Tuple[float, float], use_subtitle: bool) -> str:
+    if not use_subtitle or 'subtitle_path' not in anno or not nncore.is_file(anno['subtitle_path']):
+        return prompt
+    s, e = seg
+    subs = load_subtitle(anno['subtitle_path'])
+    subs = [f'{round(a - s, 1)}s - {round(b - s, 1)}s, {t}\n' for a, b, t in subs if a >= s and b <= e]
+    subs = ''.join(subs[:100])
+    return f'You are given a video with {round(e - s, 1)} seconds long.\nSubtitles:\n{subs}' + prompt
+
+
+def run_planner(model, processor, video_path: str, question: str, args, device: str) -> str:
+    messages = [{
+        'role': 'user',
+        'content': [{
+            'type': 'video',
+            'video': video_path,
+            'num_threads': args.num_threads,
+            'min_pixels': 36 * 28 * 28,
+            'max_pixels': args.planner_max_pixels,
+            'max_frames': args.planner_max_frames,
+            'fps': args.planner_fps
+        }, {
+            'type': 'text',
+            'text': PLANNER_PROMPT.format(question)
+        }]
+    }]
+    text = processor.apply_chat_template(messages, add_generation_prompt=True)
+    print(text)
+    images, videos = process_vision_info(messages)
+    data = processor(text=[text], images=images, videos=videos, return_tensors='pt').to(device)
+    activate_role(model, 'planner')
+    return decode_generation(model, processor, data)
+
+
+def _find_model_with_reg(model):
+    queue = [model]
+    seen = set()
+    while queue:
+        obj = queue.pop(0)
+        if obj is None:
+            continue
+        oid = id(obj)
+        if oid in seen:
+            continue
+        seen.add(oid)
+        if hasattr(obj, 'reg'):
+            return obj
+        for name in ('base_model', 'model'):
+            child = getattr(obj, name, None)
+            if child is not None:
+                queue.append(child)
+    return None
+
+
+def run_grounder(model, processor, video_path: str, query: str, duration: float, dataset_cls, args, device: str):
+    messages = [{
+        'role': 'user',
+        'content': [{
+            'type': 'video',
+            'video': video_path,
+            'num_threads': args.num_threads,
+            'min_pixels': 36 * 28 * 28,
+            'max_pixels': args.grounder_max_pixels,
+            'max_frames': args.grounder_max_frames,
+            'fps': args.grounder_fps
+        }, {
+            'type': 'text',
+            'text': GROUNDER_PROMPT.format(query)
+        }]
+    }]
+    text = processor.apply_chat_template(messages, add_generation_prompt=True)
+    print(text)
+    images, videos = process_vision_info(messages)
+    data = processor(text=[text], images=images, videos=videos, return_tensors='pt').to(device)
+    activate_role(model, 'grounder')
+    response = decode_generation(model, processor, data)
+    print(response)
+
+    reg_holder = _find_model_with_reg(model)
+    success = reg_holder is not None and hasattr(reg_holder, 'reg') and len(reg_holder.reg) > 0
+    if success:
+        blob = reg_holder.reg[0].cpu().float()
+        pred, conf = blob[:, :2] * duration, blob[:, -1].tolist()
+        pred = pred.clamp(min=0, max=duration)
+        unit = getattr(dataset_cls, 'UNIT', 0.001)
+        pred = torch.round(pred / unit).long() * unit
+        inds = (pred[:, 1] - pred[:, 0] < 0).nonzero()[:, 0]
+        pred[inds] = pred[inds].roll(1)
+        pred = pred.tolist()
+    else:
+        print('WARNING: Failed to parse grounder response')
+        if getattr(args, 'model_ver_path', None) is not None:
+            pred = [[i * duration / 6, (i + 2) * duration / 6] for i in range(5)]
+            conf = [0] * 5
+        else:
+            pred = [[0, duration]]
+            conf = [0]
+    return response, success, pred, conf
+
+
+def run_verifier(model, processor, video_path: str, question: str, pred, conf, duration: float, args, device: str):
+    probs = []
+    for cand in pred[:args.verifier_topk]:
+        s0, e0 = parse_span(cand, duration, 2)
+        offset = (e0 - s0) / 2
+        s1, e1 = parse_span([s0 - offset, e0 + offset], duration)
+        s = (s0 - s1) / (e1 - s1)
+        e = (e0 - s1) / (e1 - s1)
+        messages = [{
+            'role': 'user',
+            'content': [{
+                'type': 'video',
+                'video': video_path,
+                'num_threads': args.num_threads,
+                'video_start': s1,
+                'video_end': e1,
+                'min_pixels': 36 * 28 * 28,
+                'max_pixels': args.verifier_max_pixels,
+                'max_frames': args.verifier_max_frames,
+                'fps': args.verifier_fps
+            }, {
+                'type': 'text',
+                'text': VERIFIER_PROMPT.format(question)
+            }]
+        }]
+        text = processor.apply_chat_template(messages, add_generation_prompt=True)
+        print(text)
+        images, videos = process_vision_info(messages)
+        data = processor(text=[text], images=images, videos=videos, return_tensors='pt')
+        video_grid_thw = data['video_grid_thw'][0]
+        num_frames, window = int(video_grid_thw[0]), int(video_grid_thw[1] * video_grid_thw[2] / 4)
+        assert num_frames * window * 4 == data['pixel_values_videos'].size(0)
+
+        pos_s, pos_e = round(s * num_frames), round(e * num_frames)
+        pos_s, pos_e = min(max(0, pos_s), num_frames), min(max(0, pos_e), num_frames)
+        assert pos_s <= pos_e, (num_frames, s, e)
+
+        base_idx = torch.nonzero(data['input_ids'][0] == model.config.vision_start_token_id).item()
+        pos_s, pos_e = pos_s * window + base_idx + 1, pos_e * window + base_idx + 2
+        input_ids = data['input_ids'][0].tolist()
+        input_ids.insert(pos_s, model.config.seg_s_token_id)
+        input_ids.insert(pos_e, model.config.seg_e_token_id)
+        data['input_ids'] = torch.LongTensor([input_ids])
+        data['attention_mask'] = torch.ones_like(data['input_ids'])
+        data = data.to(device)
+
+        activate_role(model, 'verifier')
+        with torch.inference_mode():
+            logits = model(**data).logits[0, -1].softmax(dim=-1)
+        score = (logits[9454] - logits[2753]).sigmoid().item()
+        probs.append(score)
+
+    ranks = torch.Tensor(probs).argsort(descending=True).tolist()
+    pred_sorted = [pred[idx] for idx in ranks]
+    conf_sorted = [conf[idx] for idx in ranks]
+    sorted_scores = [probs[idx] for idx in ranks]
+    return probs, ranks, pred_sorted, conf_sorted, sorted_scores
+
+
+def _prepare_visual_message(video_path: str,
+                            segments: Sequence[Sequence[float]],
+                            args,
+                            dataset_cls,
+                            prompt: str) -> List[Dict[str, Any]]:
+    content: List[Dict[str, Any]] = []
+    for idx, seg in enumerate(segments):
+        s, e = float(seg[0]), float(seg[1])
+        clip_text = None
+        if len(segments) > 1:
+            clip_text = f'Clip {chr(ord("A") + idx)} shows a candidate evidence segment from {round(s, 2)}s to {round(e, 2)}s.'
+        if clip_text is not None:
+            content.append({'type': 'text', 'text': clip_text})
+        content.append({
+            'type': 'video',
+            'video': video_path,
+            'num_threads': args.num_threads,
+            'video_start': s,
+            'video_end': e,
+            'min_pixels': getattr(dataset_cls, 'MIN_PIXELS', 128) * 28 * 28,
+            'max_pixels': getattr(dataset_cls, 'MAX_PIXELS', 256) * 28 * 28,
+            'max_frames': getattr(dataset_cls, 'MAX_FRAMES', 32),
+            'fps': getattr(dataset_cls, 'FPS', 2.0)
+        })
+    content.append({'type': 'text', 'text': prompt})
+    return [{'role': 'user', 'content': content}]
+
+
+def run_answerer(model, processor, video_path: str, question: str, options: Optional[Sequence[str]],
+                 anno: Dict, segments: Sequence[Sequence[float]], dataset_cls, args, device: str,
+                 use_answerer_adapter: bool = True) -> str:
+    prompt = build_answer_prompt(question, options, args.style)
+    if len(segments) == 1:
+        prompt = maybe_add_subtitles(prompt, anno, tuple(segments[0]), args.use_subtitle)
+    else:
+        prompt = MULTI_SEGMENT_ANSWER_PROMPT.format(prompt)
+    messages = _prepare_visual_message(video_path, segments, args, dataset_cls, prompt)
+    text = processor.apply_chat_template(messages, add_generation_prompt=True)
+    text += 'Best Option: (' if args.style == 'mcq' and options is not None else ''
+    print(text)
+    images, videos = process_vision_info(messages)
+    data = processor(text=[text], images=images, videos=videos, return_tensors='pt').to(device)
+
+    if use_answerer_adapter:
+        activate_role(model, 'answerer')
+        context = nullcontext
+    else:
+        context = model.disable_adapter
+    with resolve_infer_context(context, model, 'infer_auto'):
+        return decode_generation(model, processor, data)
+
+
+def run_reverse_question(model, processor, video_path: str, answer_text: str,
+                         evidence_segments: Sequence[Sequence[float]], dataset_cls, args, device: str,
+                         use_answerer_adapter: bool = True) -> str:
+    messages = _prepare_visual_message(
+        video_path, evidence_segments, args, dataset_cls, REVERSE_QUESTION_PROMPT.format(answer_text))
+    text = processor.apply_chat_template(messages, add_generation_prompt=True)
+    print(text)
+    images, videos = process_vision_info(messages)
+    data = processor(text=[text], images=images, videos=videos, return_tensors='pt').to(device)
+
+    if use_answerer_adapter:
+        activate_role(model, 'answerer')
+        context = nullcontext
+    else:
+        context = model.disable_adapter
+    with resolve_infer_context(context, model, 'infer_auto'):
+        return decode_generation(model, processor, data)
+
+
+def run_feedback_policy(model, processor, question: str, answer_text: str,
+                        reverse_question: Optional[str], args, device: str,
+                        use_answerer_adapter: bool = True) -> str:
+    messages = [{
+        'role': 'user',
+        'content': [{
+            'type': 'text',
+            'text': FEEDBACK_PROMPT.format(question, answer_text, reverse_question or '')
+        }]
+    }]
+    text = processor.apply_chat_template(messages, add_generation_prompt=True)
+    print(text)
+    try:
+        data = processor(text=[text], return_tensors='pt').to(device)
+        if use_answerer_adapter:
+            activate_role(model, 'answerer')
+            context = nullcontext
+        else:
+            context = model.disable_adapter
+        with resolve_infer_context(context, model, 'infer_auto_feedback'):
+            return decode_generation(model, processor, data, max_new_tokens=32)
+    except Exception as e:
+        print(f'[WARN] feedback generation failed: {type(e).__name__}: {e}')
+        return ''
+
+
+def evaluate_candidate(model, processor, video_path: str, question: str, options: Optional[Sequence[str]],
+                       anno: Dict, candidate: Dict[str, Any], dataset_cls, args, device: str,
+                       answerer_adapter_enabled: bool) -> Dict[str, Any]:
+    segments = candidate['segments']
+    response = run_answerer(model, processor, video_path, question, options, anno, segments,
+                            dataset_cls, args, device,
+                            use_answerer_adapter=answerer_adapter_enabled)
+    print(response)
+    answer_text = resolve_answer_text(response, options)
+
+    reverse_question = None
+    faithfulness_score = None
+    verifier_score = candidate.get('verifier_score')
+    if candidate.get('need_sufficiency', True):
+        if verifier_score is not None and verifier_score >= args.verifier_skip_reverse_threshold:
+            faithfulness_score = verifier_score
+            print(f'skip_reverse_question verifier_score={verifier_score:.4f}')
+        else:
+            reverse_question = run_reverse_question(
+                model, processor, video_path, answer_text, segments, dataset_cls, args, device,
+                use_answerer_adapter=answerer_adapter_enabled)
+            print(reverse_question)
+            faithfulness_score = token_f1_overlap(question, reverse_question)
+            print(f'faithfulness_score={faithfulness_score:.4f}')
+
+    sufficiency_score = combine_sufficiency_score(
+        faithfulness_score, verifier_score, beta=args.sufficiency_beta)
+
+    out = dict(candidate)
+    out.update(dict(
+        response=response,
+        answer_text=answer_text,
+        reverse_question=reverse_question,
+        faithfulness_score=faithfulness_score,
+        overlap=faithfulness_score,
+        sufficiency_score=sufficiency_score,
+    ))
+    return out
+
+
+def build_candidate_pool(pred: Sequence[Sequence[float]], conf: Sequence[float], verifier_scores: Sequence[float],
+                         duration: float, dataset_cls, args) -> List[Dict[str, Any]]:
+    k = max(1, min(args.candidate_pool_size, len(pred)))
+    unit = getattr(dataset_cls, 'UNIT', 0.001)
+    if hasattr(dataset_cls, 'MIN_RATIO'):
+        min_len = duration * dataset_cls.MIN_RATIO
+    else:
+        min_len = getattr(dataset_cls, 'MIN_LEN', 32)
+
+    grounder_norm = minmax_normalize(conf[:k])
+    verifier_norm = minmax_normalize(verifier_scores[:k])
+    pool = []
+    for idx in range(k):
+        s, e = parse_span(pred[idx], duration, min_len)
+        seg = round_span([s, e], unit)
+        init_score = combine_candidate_score(
+            grounder_norm[idx] if idx < len(grounder_norm) else 0.5,
+            verifier_norm[idx] if idx < len(verifier_norm) else 0.5,
+            alpha=args.score_alpha)
+        pool.append(dict(
+            id=f'single_{idx}',
+            kind='single',
+            source_index=idx,
+            segments=[seg],
+            verifier_score=verifier_norm[idx] if idx < len(verifier_norm) else None,
+            grounder_score=grounder_norm[idx] if idx < len(grounder_norm) else None,
+            init_score=init_score,
+            history=[],
+            need_sufficiency=True,
+        ))
+    return pool
+
+
+def _candidate_history_set(candidate: Dict[str, Any]) -> set:
+    history = candidate.get('history', []) or []
+    return {str(x) for x in history}
+
+
+def plan_feedback_action(question: str,
+                         evaluated: Dict[str, Any],
+                         feedback_label: Optional[str],
+                         active_cfg: Dict[str, Any]) -> Tuple[str, str]:
+    label = feedback_label or 'uncertain'
+    direction = infer_temporal_preference(question, evaluated.get('reverse_question'), label)
+    if label in {'reason'}:
+        return 'merge-2' if active_cfg.get('use_merge_two_segments', False) else 'expand', 'left'
+    if label in {'result'}:
+        return 'merge-2' if active_cfg.get('use_merge_two_segments', False) else 'expand', 'right'
+    if label in {'temporal_order', 'dialogue'}:
+        return ('merge-2' if active_cfg.get('use_merge_two_segments', False) else 'expand', direction)
+    if label in {'subject', 'action'}:
+        return ('switch' if active_cfg.get('use_candidate_switch', False) else 'expand', direction)
+    return 'expand', direction
+
+
+def pick_switch_candidate(pool: Sequence[Dict[str, Any]],
+                          current_candidate: Dict[str, Any],
+                          args) -> Optional[Dict[str, Any]]:
+    current_id = current_candidate['id']
+    current_seg = current_candidate['segments'][0] if current_candidate.get('segments') else None
+    visited = _candidate_history_set(current_candidate) | {current_id}
+    choices = []
+    for cand in pool:
+        if cand['kind'] != 'single' or cand['id'] == current_id or cand['id'] in visited:
+            continue
+        utility = float(cand.get('init_score', 0.0))
+        if current_seg is not None:
+            utility += args.switch_diversity_weight * segment_diversity(current_seg, cand['segments'][0])
+        if cand.get('source_index') == current_candidate.get('source_index'):
+            utility -= args.switch_penalty_same_source
+        choices.append((utility, cand))
+    if not choices:
+        for cand in pool:
+            if cand['kind'] != 'single' or cand['id'] == current_id:
+                continue
+            utility = float(cand.get('init_score', 0.0))
+            if current_seg is not None:
+                utility += 0.5 * args.switch_diversity_weight * segment_diversity(current_seg, cand['segments'][0])
+            choices.append((utility, cand))
+    if not choices:
+        return None
+    _, best = sorted(choices, key=lambda x: x[0], reverse=True)[0]
+    switched = copy.deepcopy(best)
+    switched['history'] = list(visited)
+    return switched
+
+
+def pick_merge_candidate(pool: Sequence[Dict[str, Any]], current_candidate: Dict[str, Any], args) -> Optional[Dict[str, Any]]:
+    if current_candidate['kind'] != 'single':
+        return None
+    current_seg = current_candidate['segments'][0]
+    visited = _candidate_history_set(current_candidate) | {current_candidate['id']}
+    choices = []
+    for cand in pool:
+        if cand['kind'] != 'single' or cand['id'] == current_candidate['id'] or cand['id'] in visited:
+            continue
+        seg = cand['segments'][0]
+        utility = float(cand.get('init_score', 0.0)) + args.pair_diversity_weight * segment_diversity(current_seg, seg)
+        choices.append((utility, cand))
+    if not choices:
+        return None
+    best_utility, second = sorted(choices, key=lambda x: x[0], reverse=True)[0]
+    if best_utility < float(current_candidate.get('init_score', 0.0)) + args.pair_score_margin:
+        return None
+    merged_id = f"pair_{current_candidate['id']}__{second['id']}"
+    verifier_score = None
+    scores = [x.get('verifier_score') for x in (current_candidate, second) if x.get('verifier_score') is not None]
+    if scores:
+        verifier_score = sum(scores) / len(scores)
+    return dict(
+        id=merged_id,
+        kind='pair',
+        source_index=(current_candidate['source_index'], second['source_index']),
+        segments=[list(current_candidate['segments'][0]), list(second['segments'][0])],
+        verifier_score=verifier_score,
+        grounder_score=max(current_candidate.get('grounder_score', 0.0), second.get('grounder_score', 0.0)),
+        init_score=max(current_candidate.get('init_score', 0.0), second.get('init_score', 0.0)),
+        need_sufficiency=True,
+        parent_ids=[current_candidate['id'], second['id']],
+        history=list(visited | {second['id']}),
+    )
+
+
+def apply_expand_action(candidate: Dict[str, Any], duration: float, ratio: float, unit: float,
+                        direction: str = 'both', secondary_ratio: Optional[float] = None) -> Dict[str, Any]:
+    updated = copy.deepcopy(candidate)
+    if updated.get('kind') == 'pair' and secondary_ratio is not None and len(updated.get('segments', [])) > 1:
+        segments = []
+        for idx, seg in enumerate(updated['segments']):
+            seg_ratio = ratio if idx in {0, len(updated['segments']) - 1} else secondary_ratio
+            if idx == 0 and direction == 'left':
+                seg_dir = 'left'
+            elif idx == len(updated['segments']) - 1 and direction == 'right':
+                seg_dir = 'right'
+            else:
+                seg_dir = 'both'
+            segments.append(list(expand_segments_directional([seg], duration, seg_ratio, seg_dir)[0]))
+        updated['segments'] = round_segments(segments, unit)
+    else:
+        updated['segments'] = round_segments(
+            expand_segments_directional(updated['segments'], duration, ratio, direction), unit)
+    updated['history'] = list(_candidate_history_set(candidate) | {candidate['id']})
+    return updated
+
+
+def should_compute_sufficiency(round_idx: int, active_cfg: Dict[str, Any], args) -> bool:
+    if not active_cfg.get('use_sufficiency_estimation', False):
+        return False
+    max_eval_rounds = max(0, int(getattr(args, 'sufficiency_eval_rounds', 1)))
+    return round_idx <= max_eval_rounds
+
+
+def _effective_confidence(evaluated: Dict[str, Any]) -> Optional[float]:
+    """Return the strongest available confidence signal for feedback gating."""
+    vals = []
+    for key in ('sufficiency_score', 'faithfulness_score', 'verifier_score'):
+        val = evaluated.get(key)
+        if val is not None:
+            try:
+                vals.append(float(val))
+            except Exception:
+                pass
+    return max(vals) if vals else None
+
+
+def should_accept_candidate(evaluated: Dict[str, Any], active_cfg: Dict[str, Any], args) -> bool:
+    if not active_cfg.get('use_faithfulness_acceptance', False):
+        return False
+    conf = _effective_confidence(evaluated)
+    if conf is None:
+        return False
+    if conf >= args.verifier_accept_threshold:
+        return True
+    sufficiency_score = evaluated.get('sufficiency_score')
+    if sufficiency_score is None:
+        return False
+    return sufficiency_score >= (args.sufficiency_threshold - args.acceptance_margin)
+
+
+def sample_feedback_budget_allowed(args, sample_key: str) -> bool:
+    """Deterministically cap feedback candidates to the configured budget ratio.
+
+    This is intentionally conservative for high-baseline QA: it prevents almost-all-sample
+    feedback runs and keeps the actual feedback rate below the target even when the
+    sufficiency estimator is noisy.
+    """
+    ratio = max(0.0, min(1.0, float(getattr(args, 'feedback_budget_ratio', 0.18))))
+    if ratio <= 0:
+        return False
+    digest = hashlib.md5(str(sample_key).encode('utf-8')).hexdigest()
+    bucket = int(digest[:8], 16) / float(0xFFFFFFFF)
+    return bucket < ratio
+
+
+def should_trigger_feedback(evaluated: Dict[str, Any], accepted: bool, round_idx: int, active_cfg: Dict[str, Any], args) -> bool:
+    if accepted:
+        return False
+    if getattr(args, 'force_low_feedback', True) and not evaluated.get('feedback_budget_allowed', False):
+        return False
+    if round_idx >= active_cfg['max_rounds']:
+        return False
+    if not active_cfg.get('use_evidence_acquisition', False):
+        return False
+
+    conf = _effective_confidence(evaluated)
+    sufficiency_score = evaluated.get('sufficiency_score')
+
+    # Extreme low-feedback policy: only budget-allowed and clearly low-confidence
+    # samples enter feedback. Borderline samples stop at round 1 to avoid wrong edits.
+    if conf is None:
+        return False
+    if conf >= args.feedback_verifier_floor:
+        return False
+    if sufficiency_score is None:
+        return False
+    return sufficiency_score < (args.sufficiency_threshold - args.min_feedback_gap)
+
+
+def choose_final_round(rounds, selection_rule: str):
+    if len(rounds) == 0:
+        return None
+    if selection_rule == 'last':
+        return rounds[-1]
+    if selection_rule == 'first_sufficient':
+        for round_info in rounds:
+            if round_info.get('accepted', False):
+                return round_info
+        return rounds[-1]
+    if selection_rule == 'best_faithfulness':
+        valid = [r for r in rounds if r.get('faithfulness_score') is not None]
+        if len(valid) == 0:
+            return rounds[-1]
+        valid = sorted(valid, key=lambda x: ((x.get('sufficiency_score') if x.get('sufficiency_score') is not None else -1),
+                                             (x.get('faithfulness_score') if x.get('faithfulness_score') is not None else -1),
+                                             -x['round']))
+        return valid[-1]
+    raise ValueError(f'unsupported selection rule: {selection_rule}')
+
+
+if __name__ == '__main__':
+    args = parse_args()
+    variant_name = args.active_variant or args.feedback_variant or 'baseline'
+    normalized_selection = resolve_selection_rule(args.selection_rule) if args.selection_rule is not None else None
+    active_cfg = resolve_active_variant(variant_name, args.max_rounds, normalized_selection)
+
+    if args.chunk > 1:
+        pred_path = nncore.join(args.pred_path, f'output_{args.index}.json')
+    else:
+        pred_path = nncore.join(args.pred_path, 'output.json')
+
+    print(f'Dataset: {args.dataset}({args.split}) Chunk: {args.chunk} Index: {args.index} Output Path: {pred_path}')
+    print(f'Active-Evidence Config: {json.dumps(active_cfg, indent=2)}')
+
+    adapter_state = dict(planner=False, verifier=False, answerer=False)
+    print('Initializing role *grounder*')
+    model, processor = build_model(args.model_gnd_path, device=args.device)
+    device = next(model.parameters()).device
+
+    if args.model_pla_path is not None:
+        adapter_path = nncore.join(args.model_pla_path, 'planner')
+        if nncore.is_dir(adapter_path):
+            print('Initializing role *planner*')
+            model.load_adapter(adapter_path, adapter_name='planner')
+            adapter_state['planner'] = True
+
+    if args.model_ver_path is not None:
+        adapter_path = nncore.join(args.model_ver_path, 'verifier')
+        if nncore.is_dir(adapter_path):
+            print('Initializing role *verifier*')
+            model.load_adapter(adapter_path, adapter_name='verifier')
+            adapter_state['verifier'] = True
+
+    if args.model_ans_path is not None:
+        adapter_path = nncore.join(args.model_ans_path, 'answerer')
+        if nncore.is_dir(adapter_path):
+            print('Initializing role *answerer*')
+            model.load_adapter(adapter_path, adapter_name='answerer')
+            adapter_state['answerer'] = True
+
+    dataset_cls = DATASETS.get(args.dataset)
+    annos = dataset_cls.load_annos(split=args.split)
+    annos = [annos[i::args.chunk] for i in range(args.chunk)][args.index]
+    dumps = []
+
+    for i in nncore.ProgressBar(range(len(annos))):
+        anno = copy.deepcopy(annos[i])
+        dump = copy.deepcopy(annos[i])
+        dump['active_config'] = copy.deepcopy(active_cfg)
+        dump['feedback_config'] = copy.deepcopy(active_cfg)
+
+        video_path, duration = anno['video_path'], anno.get('duration')
+        if duration is None:
+            duration = get_duration(video_path, num_threads=args.num_threads)
+            dump['duration'] = duration
+
+        print('\n', video_path)
+        print(duration)
+
+        do_answering = all(k in anno for k in ('question', 'options'))
+        options = None
+        if do_answering:
+            question, options, ans = anno['question'], anno['options'], anno['ans']
+            preview_prompt = build_answer_prompt(question, options, args.style)
+            print(preview_prompt)
+            print(options)
+            print(ans)
+        else:
+            question = anno['query']
+            print(question)
+
+        do_grounding = True
+        query = question
+        dump['agents'] = []
+
+        if adapter_state['planner'] and (args.auto_rephrasing or args.auto_planning):
+            print('=============== planner ===============')
+            dump['agents'].append('planner')
+            response = run_planner(model, processor, video_path, question, args, device)
+            print(response)
+            dump['planner_response'] = response
+            try:
+                parsed = json.loads(response)
+                action = parsed[0] if isinstance(parsed, list) else parsed
+                if args.auto_rephrasing and action['type'].lower() == 'grounder' and action['value']:
+                    query = action['value']
+                    dump['planner_parsed_query'] = query
+                elif args.auto_planning and action['type'].lower() == 'answerer':
+                    do_grounding = False
+            except Exception:
+                print('WARNING: Failed to parse planner response')
+
+        pred, conf, verifier_scores = [[0, duration]], [0.0], [0.0]
+        if do_grounding:
+            print('=============== grounder ===============')
+            dump['agents'].append('grounder')
+            query = parse_query(query)
+            response, success, pred, conf = run_grounder(model, processor, video_path, query, duration,
+                                                         dataset_cls, args, device)
+            dump['grounder_response'] = response
+            dump['grounder_success'] = success
+            dump['pred'] = pred
+            dump['conf'] = conf
+
+        if do_grounding and adapter_state['verifier'] and len(pred) > 1:
+            print('=============== verifier ===============')
+            dump['agents'].append('verifier')
+            probs, ranks, pred_sorted, conf_sorted, verifier_scores = run_verifier(
+                model, processor, video_path, question, pred, conf, duration, args, device)
+            print(probs)
+            print(ranks)
+            dump['probs'] = probs
+            dump['ranks'] = ranks
+            dump['pred_ori'] = dump['pred']
+            dump['conf_ori'] = dump['conf']
+            pred = pred_sorted
+            conf = conf_sorted
+            dump['pred'] = pred
+            dump['conf'] = conf
+            dump['verifier_scores'] = verifier_scores
+        else:
+            dump['verifier_scores'] = verifier_scores
+
+        if do_answering:
+            print('=============== active evidence reasoning ===============')
+            dump['agents'].append('answerer')
+            pool = build_candidate_pool(pred, conf, verifier_scores, duration, dataset_cls, args)
+            dump['candidate_pool_init'] = copy.deepcopy(pool)
+            unit = getattr(dataset_cls, 'UNIT', 0.001)
+            current_candidate = copy.deepcopy(pool[0])
+            rounds = []
+            accepted_round = None
+            pair_generation_used = False
+
+            for round_idx in range(1, active_cfg['max_rounds'] + 1):
+                print(f'=============== reasoning round {round_idx} ===============')
+                current_candidate['need_sufficiency'] = should_compute_sufficiency(round_idx, active_cfg, args)
+                try:
+                    evaluated = evaluate_candidate(
+                        model, processor, video_path, question, options, anno, current_candidate,
+                        dataset_cls, args, device, adapter_state['answerer'])
+                except Exception as e:
+                    if current_candidate.get('kind') == 'pair' and not args.disable_pair_fallback_union:
+                        print(f'[WARN] pair candidate failed, fallback to union span: {type(e).__name__}: {e}')
+                        pair_generation_used = True
+                        fallback = copy.deepcopy(current_candidate)
+                        fallback['kind'] = 'single'
+                        fallback['segments'] = [round_span(union_span(current_candidate['segments'], duration), unit)]
+                        evaluated = evaluate_candidate(
+                            model, processor, video_path, question, options, anno, fallback,
+                            dataset_cls, args, device, adapter_state['answerer'])
+                        evaluated['fallback_from_pair'] = current_candidate['id']
+                    else:
+                        raise
+
+                sample_key = f"{video_path}::{question}"
+                evaluated['feedback_budget_allowed'] = sample_feedback_budget_allowed(args, sample_key)
+                accepted = should_accept_candidate(evaluated, active_cfg, args)
+                if accepted:
+                    accepted_round = round_idx
+
+                feedback_response = None
+                feedback_label = None
+                action = 'stop' if accepted else None
+
+                if should_trigger_feedback(evaluated, accepted, round_idx, active_cfg, args):
+                    if active_cfg.get('use_feedback_policy', False):
+                        feedback_response = run_feedback_policy(
+                            model, processor, question, evaluated['answer_text'],
+                            evaluated.get('reverse_question'), args, device,
+                            use_answerer_adapter=adapter_state['answerer'])
+                    feedback_label = parse_feedback_label(feedback_response)
+                    if feedback_label == 'uncertain':
+                        feedback_label = heuristic_feedback_label(question, evaluated.get('reverse_question'))
+
+                    planned_action, expand_direction = plan_feedback_action(
+                        question, evaluated, feedback_label, active_cfg)
+
+                    if planned_action == 'merge-2':
+                        merged = pick_merge_candidate(pool, evaluated, args)
+                        if merged is not None:
+                            current_candidate = merged
+                            action = f'merge-2[{expand_direction}]'
+                        else:
+                            current_candidate = apply_expand_action(
+                                evaluated, duration, args.boundary_expand_ratio, unit,
+                                direction=expand_direction, secondary_ratio=args.expand_secondary_ratio)
+                            action = f'expand-{expand_direction}'
+                    elif planned_action == 'switch':
+                        switched = pick_switch_candidate(pool, evaluated, args)
+                        if switched is not None:
+                            current_candidate = switched
+                            action = f'switch[{expand_direction}]'
+                        else:
+                            current_candidate = apply_expand_action(
+                                evaluated, duration, args.boundary_expand_ratio, unit,
+                                direction=expand_direction, secondary_ratio=args.expand_secondary_ratio)
+                            action = f'expand-{expand_direction}'
+                    else:
+                        current_candidate = apply_expand_action(
+                            evaluated, duration, args.boundary_expand_ratio, unit,
+                            direction=expand_direction, secondary_ratio=args.expand_secondary_ratio)
+                        action = f'expand-{expand_direction}'
+
+                round_info = dict(
+                    round=round_idx,
+                    candidate_id=evaluated['id'],
+                    candidate_kind=evaluated.get('kind'),
+                    source_index=evaluated.get('source_index'),
+                    evidence_segments=copy.deepcopy(evaluated['segments']),
+                    evidence_state=copy.deepcopy(evaluated['segments']),
+                    span=copy.deepcopy(evaluated['segments'][0] if len(evaluated['segments']) == 1 else union_span(evaluated['segments'], duration)),
+                    response=evaluated['response'],
+                    answer_text=evaluated['answer_text'],
+                    reverse_question=evaluated.get('reverse_question'),
+                    faithfulness_score=evaluated.get('faithfulness_score'),
+                    overlap=evaluated.get('faithfulness_score'),
+                    sufficiency_score=evaluated.get('sufficiency_score'),
+                    verifier_score=evaluated.get('verifier_score'),
+                    accepted=accepted,
+                    feedback_response=feedback_response,
+                    feedback_label=feedback_label,
+                    action=action,
+                    next_candidate_id=(current_candidate.get('id') if action and action != 'stop' else evaluated['id']),
+                )
+                rounds.append(round_info)
+                if accepted or not active_cfg['use_evidence_acquisition'] or round_idx >= active_cfg['max_rounds']:
+                    break
+
+            final_round = choose_final_round(rounds, active_cfg['selection_rule'])
+            dump['evidence_rounds'] = rounds
+            dump['feedback_rounds'] = dump['evidence_rounds']
+            dump['executed_rounds'] = len(rounds)
+            dump['accepted_round'] = accepted_round
+            dump['selected_round'] = final_round['round'] if final_round is not None else None
+            dump['selected_span'] = final_round['span'] if final_round is not None else None
+            dump['selected_evidence_state'] = final_round['evidence_state'] if final_round is not None else None
+            dump['selected_candidate_id'] = final_round['candidate_id'] if final_round is not None else None
+            dump['selected_candidate_kind'] = final_round['candidate_kind'] if final_round is not None else None
+            dump['final_answer_text'] = final_round['answer_text'] if final_round is not None else ''
+            dump['response'] = final_round['response'] if final_round is not None else ''
+            dump['answerer_response'] = dump['response']
+            dump['reverse_question'] = final_round['reverse_question'] if final_round is not None else None
+            dump['faithfulness_score'] = final_round['faithfulness_score'] if final_round is not None else None
+            dump['sufficiency_score'] = final_round.get('sufficiency_score') if final_round is not None else None
+            dump['overlap'] = dump['faithfulness_score']
+            dump['evidence_sufficient'] = accepted_round is not None
+            dump['pair_generation_used'] = pair_generation_used
+        dumps.append(dump)
+
+    nncore.dump(dumps, pred_path)

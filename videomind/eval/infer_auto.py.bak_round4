@@ -1,0 +1,640 @@
+# Copyright (c) 2025 Ye Liu. Licensed under the BSD-3-Clause License.
+# Modified in 2026 to support active-evidence reasoning experiments.
+
+import argparse
+import copy
+import json
+from contextlib import nullcontext
+from typing import Dict, Optional, Sequence, Tuple
+
+import nncore
+import torch
+
+from videomind.constants import (GROUNDER_PROMPT, PLANNER_PROMPT,
+                                 REVERSE_QUESTION_PROMPT, VERIFIER_PROMPT)
+from videomind.dataset.hybrid import DATASETS
+from videomind.dataset.utils import process_vision_info
+from videomind.model.builder import build_model
+from videomind.utils.active_evidence import (expand_span, resolve_active_variant,
+                                             resolve_answer_text,
+                                             resolve_selection_rule,
+                                             round_span, token_f1_overlap)
+from videomind.utils.io import get_duration, load_subtitle
+from videomind.utils.parser import parse_query, parse_span
+
+
+def parse_args():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--dataset')
+    parser.add_argument('--pred_path')
+    parser.add_argument('--model_gnd_path')
+    parser.add_argument('--model_ver_path')
+    parser.add_argument('--model_pla_path')
+    parser.add_argument('--model_ans_path')
+    parser.add_argument('--split', default='test', choices=['train', 'valid', 'test'])
+    parser.add_argument('--style', default='mcq', choices=['mcq', 'options', 'direct'])
+    parser.add_argument('--use_subtitle', action='store_true')
+    parser.add_argument('--auto_rephrasing', action='store_true')
+    parser.add_argument('--auto_planning', action='store_true')
+    parser.add_argument('--num_threads', type=int, default=1)
+    parser.add_argument('--device', default='auto')
+    parser.add_argument('--chunk', type=int, default=1)
+    parser.add_argument('--index', type=int, default=0)
+
+    # Active-evidence reasoning controls.
+    parser.add_argument('--active_variant', default=None,
+                        choices=['baseline', 'es_only', 'es_fa', 'es_fa_ea', 'full'])
+    # Backward-compatible alias from the older naming.
+    parser.add_argument('--feedback_variant', default=None,
+                        choices=['baseline', 'qr_only', 'qr_oa', 'qr_oa_br', 'full'])
+    parser.add_argument('--max_rounds', type=int, default=3)
+    parser.add_argument('--sufficiency_threshold', type=float, default=0.8)
+    parser.add_argument('--overlap_threshold', type=float, default=None)
+    parser.add_argument('--boundary_expand_ratio', type=float, default=0.1)
+    parser.add_argument('--selection_rule', default=None,
+                        choices=['last', 'first_sufficient', 'first_accepted',
+                                 'best_faithfulness', 'best_overlap'])
+    parser.add_argument('--save_round_details', action='store_true')
+
+    # Memory-safe video budgets for rounds/efficiency experiments.
+    parser.add_argument('--planner_max_pixels', type=int, default=36 * 28 * 28)
+    parser.add_argument('--planner_max_frames', type=int, default=24)
+    parser.add_argument('--planner_fps', type=float, default=0.5)
+
+    parser.add_argument('--grounder_max_pixels', type=int, default=48 * 28 * 28)
+    parser.add_argument('--grounder_max_frames', type=int, default=48)
+    parser.add_argument('--grounder_fps', type=float, default=0.5)
+
+    parser.add_argument('--verifier_topk', type=int, default=3)
+    parser.add_argument('--verifier_max_pixels', type=int, default=48 * 28 * 28)
+    parser.add_argument('--verifier_max_frames', type=int, default=24)
+    parser.add_argument('--verifier_fps', type=float, default=1.0)
+
+    # Memory-safe video budgets for rounds/efficiency experiments.
+
+
+    args = parser.parse_args()
+
+    if args.overlap_threshold is not None:
+        args.sufficiency_threshold = args.overlap_threshold
+    if args.active_variant is None and args.feedback_variant is None:
+        args.active_variant = 'baseline'
+    return args
+
+
+
+def activate_role(model, role):
+    """Switch between base model and loaded PEFT adapters.
+
+    Assumption for the current checkpoint:
+    - grounder / answerer -> use base model weights (no adapter)
+    - planner / verifier  -> use loaded adapters
+    """
+    base = getattr(model, "base_model", None)
+
+    # try to infer loaded adapter names
+    available = set()
+    if hasattr(model, "peft_config") and model.peft_config is not None:
+        try:
+            available.update(model.peft_config.keys())
+        except Exception:
+            pass
+    if base is not None and hasattr(base, "peft_config") and base.peft_config is not None:
+        try:
+            available.update(base.peft_config.keys())
+        except Exception:
+            pass
+
+    # roles that should fall back to base model
+    if role in {"grounder", "answerer"} and role not in available:
+        if hasattr(model, "disable_adapters"):
+            model.disable_adapters()
+            return
+        if base is not None and hasattr(base, "disable_adapters"):
+            base.disable_adapters()
+            return
+        return
+
+    # preferred modern API
+    if hasattr(model, "set_adapter"):
+        model.set_adapter(role)
+        return
+    if base is not None and hasattr(base, "set_adapter"):
+        base.set_adapter(role)
+        return
+
+    raise AttributeError(
+        f"Cannot activate role={role!r}; available adapters={sorted(available) if available else 'unknown'}"
+    )
+def decode_generation(model, processor, data, max_new_tokens: int = 256) -> str:
+    output_ids = model.generate(
+        **data,
+        do_sample=False,
+        temperature=None,
+        top_p=None,
+        top_k=None,
+        repetition_penalty=None,
+        max_new_tokens=max_new_tokens)
+    assert data.input_ids.size(0) == output_ids.size(0) == 1
+    output_ids = output_ids[0, data.input_ids.size(1):]
+    if len(output_ids) > 0 and output_ids[-1] == processor.tokenizer.eos_token_id:
+        output_ids = output_ids[:-1]
+    return processor.decode(output_ids, clean_up_tokenization_spaces=False)
+
+
+
+def build_answer_prompt(question: str, options: Optional[Sequence[str]], style: str) -> str:
+    if options is None:
+        return question
+    if style in ('mcq', 'options'):
+        prompt = question + '\nOptions:'
+        for idx, opt in enumerate(options):
+            opt = str(opt)
+            prompt += f"\n({chr(ord('A') + idx)}) {opt[0].upper() + opt[1:]}"
+        prompt += '\nPlease only give the best option.'
+        return prompt
+    return question
+
+
+
+def maybe_add_subtitles(prompt: str, anno: Dict, seg: Tuple[float, float], use_subtitle: bool) -> str:
+    if not use_subtitle or 'subtitle_path' not in anno or not nncore.is_file(anno['subtitle_path']):
+        return prompt
+    s, e = seg
+    subs = load_subtitle(anno['subtitle_path'])
+    subs = [f'{round(a - s, 1)}s - {round(b - s, 1)}s, {t}\n' for a, b, t in subs if a >= s and b <= e]
+    subs = ''.join(subs[:100])
+    return f'You are given a video with {round(e - s, 1)} seconds long.\nSubtitles:\n{subs}' + prompt
+
+
+
+def run_planner(model, processor, video_path: str, question: str, args, device: str) -> str:
+    messages = [{
+        'role': 'user',
+        'content': [{
+            'type': 'video',
+            'video': video_path,
+            'num_threads': args.num_threads,
+            'min_pixels': 36 * 28 * 28,
+            'max_pixels': args.planner_max_pixels,
+            'max_frames': args.planner_max_frames,
+            'fps': args.planner_fps
+        }, {
+            'type': 'text',
+            'text': PLANNER_PROMPT.format(question)
+        }]
+    }]
+    text = processor.apply_chat_template(messages, add_generation_prompt=True)
+    print(text)
+    images, videos = process_vision_info(messages)
+    data = processor(text=[text], images=images, videos=videos, return_tensors='pt').to(device)
+    activate_role(model, 'planner')
+    return decode_generation(model, processor, data)
+
+
+
+
+def _find_model_with_reg(model):
+    """Breadth-first search through PEFT/base-model wrappers after generation."""
+    queue = [model]
+    seen = set()
+
+    while queue:
+        obj = queue.pop(0)
+        if obj is None:
+            continue
+        oid = id(obj)
+        if oid in seen:
+            continue
+        seen.add(oid)
+
+        if hasattr(obj, "reg"):
+            return obj
+
+        for name in ("base_model", "model"):
+            child = getattr(obj, name, None)
+            if child is not None:
+                queue.append(child)
+
+    return None
+
+def run_grounder(model, processor, video_path: str, query: str, duration: float, dataset_cls, args,
+                 device: str):
+    messages = [{
+        'role': 'user',
+        'content': [{
+            'type': 'video',
+            'video': video_path,
+            'num_threads': args.num_threads,
+            'min_pixels': 36 * 28 * 28,
+            'max_pixels': args.grounder_max_pixels,
+            'max_frames': args.grounder_max_frames,
+            'fps': args.grounder_fps
+        }, {
+            'type': 'text',
+            'text': GROUNDER_PROMPT.format(query)
+        }]
+    }]
+    text = processor.apply_chat_template(messages, add_generation_prompt=True)
+    print(text)
+    images, videos = process_vision_info(messages)
+    data = processor(text=[text], images=images, videos=videos, return_tensors='pt').to(device)
+    activate_role(model, 'grounder')
+    response = decode_generation(model, processor, data)
+    print(response)
+
+    reg_holder = _find_model_with_reg(model)
+    success = reg_holder is not None and hasattr(reg_holder, "reg") and len(reg_holder.reg) > 0
+    if success:
+        blob = reg_holder.reg[0].cpu().float()
+        pred, conf = blob[:, :2] * duration, blob[:, -1].tolist()
+        pred = pred.clamp(min=0, max=duration)
+        unit = getattr(dataset_cls, 'UNIT', 0.001)
+        pred = torch.round(pred / unit).long() * unit
+        inds = (pred[:, 1] - pred[:, 0] < 0).nonzero()[:, 0]
+        pred[inds] = pred[inds].roll(1)
+        pred = pred.tolist()
+    else:
+        print('WARNING: Failed to parse grounder response')
+        if getattr(args, 'model_ver_path', None) is not None:
+            pred = [[i * duration / 6, (i + 2) * duration / 6] for i in range(5)]
+            conf = [0] * 5
+        else:
+            pred = [[0, duration]]
+            conf = [0]
+
+    return response, success, pred, conf
+
+
+
+def run_verifier(model, processor, video_path: str, question: str, pred, conf, duration: float, args,
+                 device: str):
+    probs = []
+    for cand in pred[:args.verifier_topk]:
+        s0, e0 = parse_span(cand, duration, 2)
+        offset = (e0 - s0) / 2
+        s1, e1 = parse_span([s0 - offset, e0 + offset], duration)
+        s = (s0 - s1) / (e1 - s1)
+        e = (e0 - s1) / (e1 - s1)
+        messages = [{
+            'role': 'user',
+            'content': [{
+                'type': 'video',
+                'video': video_path,
+                'num_threads': args.num_threads,
+                'video_start': s1,
+                'video_end': e1,
+                'min_pixels': 36 * 28 * 28,
+                'max_pixels': args.verifier_max_pixels,
+                'max_frames': args.verifier_max_frames,
+                'fps': args.verifier_fps
+            }, {
+                'type': 'text',
+                'text': VERIFIER_PROMPT.format(question)
+            }]
+        }]
+        text = processor.apply_chat_template(messages, add_generation_prompt=True)
+        print(text)
+        images, videos = process_vision_info(messages)
+        data = processor(text=[text], images=images, videos=videos, return_tensors='pt')
+
+        video_grid_thw = data['video_grid_thw'][0]
+        num_frames, window = int(video_grid_thw[0]), int(video_grid_thw[1] * video_grid_thw[2] / 4)
+        assert num_frames * window * 4 == data['pixel_values_videos'].size(0)
+
+        pos_s, pos_e = round(s * num_frames), round(e * num_frames)
+        pos_s, pos_e = min(max(0, pos_s), num_frames), min(max(0, pos_e), num_frames)
+        assert pos_s <= pos_e, (num_frames, s, e)
+
+        base_idx = torch.nonzero(data['input_ids'][0] == model.config.vision_start_token_id).item()
+        pos_s, pos_e = pos_s * window + base_idx + 1, pos_e * window + base_idx + 2
+
+        input_ids = data['input_ids'][0].tolist()
+        input_ids.insert(pos_s, model.config.seg_s_token_id)
+        input_ids.insert(pos_e, model.config.seg_e_token_id)
+        data['input_ids'] = torch.LongTensor([input_ids])
+        data['attention_mask'] = torch.ones_like(data['input_ids'])
+        data = data.to(device)
+
+        activate_role(model, 'verifier')
+        with torch.inference_mode():
+            logits = model(**data).logits[0, -1].softmax(dim=-1)
+        score = (logits[9454] - logits[2753]).sigmoid().item()
+        probs.append(score)
+
+    ranks = torch.Tensor(probs).argsort(descending=True).tolist()
+    pred_sorted = [pred[idx] for idx in ranks]
+    conf_sorted = [conf[idx] for idx in ranks]
+    sorted_scores = [probs[idx] for idx in ranks]
+    return probs, ranks, pred_sorted, conf_sorted, sorted_scores
+
+
+
+def run_answerer(model, processor, video_path: str, question: str, options: Optional[Sequence[str]],
+                 anno: Dict, seg: Tuple[float, float], dataset_cls, args, device: str,
+                 use_answerer_adapter: bool = True) -> str:
+    prompt = build_answer_prompt(question, options, args.style)
+    prompt = maybe_add_subtitles(prompt, anno, seg, args.use_subtitle)
+    s, e = seg
+    messages = [{
+        'role': 'user',
+        'content': [{
+            'type': 'video',
+            'video': video_path,
+            'num_threads': args.num_threads,
+            'video_start': s,
+            'video_end': e,
+            'min_pixels': getattr(dataset_cls, 'MIN_PIXELS', 128) * 28 * 28,
+            'max_pixels': getattr(dataset_cls, 'MAX_PIXELS', 256) * 28 * 28,
+            'max_frames': getattr(dataset_cls, 'MAX_FRAMES', 32),
+            'fps': getattr(dataset_cls, 'FPS', 2.0)
+        }, {
+            'type': 'text',
+            'text': prompt
+        }]
+    }]
+
+    text = processor.apply_chat_template(messages, add_generation_prompt=True)
+    text += 'Best Option: (' if args.style == 'mcq' and options is not None else ''
+    print(text)
+    images, videos = process_vision_info(messages)
+    data = processor(text=[text], images=images, videos=videos, return_tensors='pt').to(device)
+
+    if use_answerer_adapter:
+        activate_role(model, 'answerer')
+        context = nullcontext
+    else:
+        context = model.disable_adapter
+
+    with context():
+        return decode_generation(model, processor, data)
+
+
+
+def run_reverse_question(model, processor, video_path: str, answer_text: str,
+                         evidence_seg: Tuple[float, float], dataset_cls, args, device: str,
+                         use_answerer_adapter: bool = True) -> str:
+    s, e = evidence_seg
+    messages = [{
+        'role': 'user',
+        'content': [{
+            'type': 'video',
+            'video': video_path,
+            'num_threads': args.num_threads,
+            'video_start': s,
+            'video_end': e,
+            'min_pixels': getattr(dataset_cls, 'MIN_PIXELS', 128) * 28 * 28,
+            'max_pixels': getattr(dataset_cls, 'MAX_PIXELS', 256) * 28 * 28,
+            'max_frames': getattr(dataset_cls, 'MAX_FRAMES', 32),
+            'fps': getattr(dataset_cls, 'FPS', 2.0)
+        }, {
+            'type': 'text',
+            'text': REVERSE_QUESTION_PROMPT.format(answer_text)
+        }]
+    }]
+    text = processor.apply_chat_template(messages, add_generation_prompt=True)
+    print(text)
+    images, videos = process_vision_info(messages)
+    data = processor(text=[text], images=images, videos=videos, return_tensors='pt').to(device)
+
+    if use_answerer_adapter:
+        activate_role(model, 'answerer')
+        context = nullcontext
+    else:
+        context = model.disable_adapter
+
+    with context():
+        return decode_generation(model, processor, data)
+
+
+
+def choose_final_round(rounds, selection_rule: str):
+    if len(rounds) == 0:
+        return None
+    if selection_rule == 'last':
+        return rounds[-1]
+    if selection_rule == 'first_sufficient':
+        for round_info in rounds:
+            if round_info.get('accepted', False):
+                return round_info
+        return rounds[-1]
+    if selection_rule == 'best_faithfulness':
+        valid = [r for r in rounds if r.get('faithfulness_score') is not None]
+        if len(valid) == 0:
+            return rounds[-1]
+        valid = sorted(valid, key=lambda x: (x['faithfulness_score'], -x['round']))
+        return valid[-1]
+    raise ValueError(f'unsupported selection rule: {selection_rule}')
+
+
+if __name__ == '__main__':
+    args = parse_args()
+    variant_name = args.active_variant or args.feedback_variant or 'baseline'
+    normalized_selection = resolve_selection_rule(args.selection_rule) if args.selection_rule is not None else None
+    active_cfg = resolve_active_variant(variant_name, args.max_rounds, normalized_selection)
+
+    if args.chunk > 1:
+        pred_path = nncore.join(args.pred_path, f'output_{args.index}.json')
+    else:
+        pred_path = nncore.join(args.pred_path, 'output.json')
+
+    print(f'Dataset: {args.dataset}({args.split}) Chunk: {args.chunk} Index: {args.index} Output Path: {pred_path}')
+    print(f'Active-Evidence Config: {json.dumps(active_cfg, indent=2)}')
+
+    adapter_state = dict(planner=False, verifier=False, answerer=False)
+
+    print('Initializing role *grounder*')
+    model, processor = build_model(args.model_gnd_path, device=args.device)
+    device = next(model.parameters()).device
+
+    if args.model_pla_path is not None:
+        adapter_path = nncore.join(args.model_pla_path, 'planner')
+        if nncore.is_dir(adapter_path):
+            print('Initializing role *planner*')
+            model.load_adapter(adapter_path, adapter_name='planner')
+            adapter_state['planner'] = True
+
+    if args.model_ver_path is not None:
+        adapter_path = nncore.join(args.model_ver_path, 'verifier')
+        if nncore.is_dir(adapter_path):
+            print('Initializing role *verifier*')
+            model.load_adapter(adapter_path, adapter_name='verifier')
+            adapter_state['verifier'] = True
+
+    if args.model_ans_path is not None:
+        adapter_path = nncore.join(args.model_ans_path, 'answerer')
+        if nncore.is_dir(adapter_path):
+            print('Initializing role *answerer*')
+            model.load_adapter(adapter_path, adapter_name='answerer')
+            adapter_state['answerer'] = True
+
+    dataset_cls = DATASETS.get(args.dataset)
+    annos = dataset_cls.load_annos(split=args.split)
+    annos = [annos[i::args.chunk] for i in range(args.chunk)][args.index]
+
+    dumps = []
+    for i in nncore.ProgressBar(range(len(annos))):
+        anno = copy.deepcopy(annos[i])
+        dump = copy.deepcopy(annos[i])
+        dump['active_config'] = copy.deepcopy(active_cfg)
+        dump['feedback_config'] = copy.deepcopy(active_cfg)  # backward-compatible field
+
+        video_path, duration, span = anno['video_path'], anno.get('duration'), anno.get('span')
+        if duration is None:
+            duration = get_duration(video_path, num_threads=args.num_threads)
+            dump['duration'] = duration
+
+        print() 
+        print(video_path)
+        print(duration)
+
+        do_answering = all(k in anno for k in ('question', 'options'))
+        options = None
+        if do_answering:
+            question, options, ans = anno['question'], anno['options'], anno['ans']
+            preview_prompt = build_answer_prompt(question, options, args.style)
+            print(preview_prompt)
+            print(options)
+            print(ans)
+        else:
+            question = anno['query']
+            print(question)
+
+        do_grounding = True
+        query = question
+        dump['agents'] = []
+
+        if adapter_state['planner'] and (args.auto_rephrasing or args.auto_planning):
+            print('=============== planner ===============')
+            dump['agents'].append('planner')
+            response = run_planner(model, processor, video_path, question, args, device)
+            print(response)
+            dump['planner_response'] = response
+            try:
+                parsed = json.loads(response)
+                action = parsed[0] if isinstance(parsed, list) else parsed
+                if args.auto_rephrasing and action['type'].lower() == 'grounder' and action['value']:
+                    query = action['value']
+                    dump['planner_parsed_query'] = query
+                elif args.auto_planning and action['type'].lower() == 'answerer':
+                    do_grounding = False
+            except Exception:
+                print('WARNING: Failed to parse planner response')
+
+        pred, conf, verifier_scores = [[0, duration]], [0.0], [0.0]
+        if do_grounding:
+            print('=============== grounder ===============')
+            dump['agents'].append('grounder')
+            query = parse_query(query)
+            response, success, pred, conf = run_grounder(model, processor, video_path, query, duration,
+                                                         dataset_cls, args, device)
+            dump['grounder_response'] = response
+            dump['grounder_success'] = success
+            dump['pred'] = pred
+            dump['conf'] = conf
+
+        if do_grounding and adapter_state['verifier'] and len(pred) > 1:
+            print('=============== verifier ===============')
+            dump['agents'].append('verifier')
+            probs, ranks, pred_sorted, conf_sorted, verifier_scores = run_verifier(
+                model, processor, video_path, question, pred, conf, duration, args, device)
+            print(probs)
+            print(ranks)
+            dump['probs'] = probs
+            dump['ranks'] = ranks
+            dump['pred_ori'] = dump['pred']
+            dump['conf_ori'] = dump['conf']
+            pred = pred_sorted
+            conf = conf_sorted
+            dump['pred'] = pred
+            dump['conf'] = conf
+            dump['verifier_scores'] = verifier_scores
+        else:
+            dump['verifier_scores'] = verifier_scores
+
+        if do_answering:
+            print('=============== active evidence reasoning ===============')
+            dump['agents'].append('answerer')
+            selected = pred[0] if 'pred' in dump else [0, duration]
+            if hasattr(dataset_cls, 'MIN_RATIO'):
+                min_len = duration * dataset_cls.MIN_RATIO
+            else:
+                min_len = getattr(dataset_cls, 'MIN_LEN', 32)
+
+            s, e = parse_span(selected, duration, min_len)
+            unit = getattr(dataset_cls, 'UNIT', 0.001)
+            current_seg = tuple(round_span([s, e], unit))
+
+            rounds = []
+            accepted_round = None
+            for round_idx in range(1, active_cfg['max_rounds'] + 1):
+                print(f'=============== reasoning round {round_idx} ===============')
+                response = run_answerer(model, processor, video_path, question, options, anno, current_seg,
+                                        dataset_cls, args, device,
+                                        use_answerer_adapter=adapter_state['answerer'])
+                print(response)
+                answer_text = resolve_answer_text(response, options)
+
+                reverse_question = None
+                faithfulness_score = None
+                accepted = False
+
+                if active_cfg['use_sufficiency_estimation']:
+                    print(f'=============== sufficiency probe round {round_idx} ===============')
+                    reverse_question = run_reverse_question(
+                        model, processor, video_path, answer_text, current_seg, dataset_cls, args, device,
+                        use_answerer_adapter=adapter_state['answerer'])
+                    print(reverse_question)
+                    faithfulness_score = token_f1_overlap(question, reverse_question)
+                    print(f'faithfulness_score={faithfulness_score:.4f}')
+
+                if active_cfg['use_faithfulness_acceptance'] and \
+                   faithfulness_score is not None and \
+                   faithfulness_score >= args.sufficiency_threshold:
+                    accepted = True
+                    accepted_round = round_idx
+
+                round_info = dict(
+                    round=round_idx,
+                    evidence_state=[float(current_seg[0]), float(current_seg[1])],
+                    span=[float(current_seg[0]), float(current_seg[1])],
+                    response=response,
+                    answer_text=answer_text,
+                    reverse_question=reverse_question,
+                    faithfulness_score=faithfulness_score,
+                    overlap=faithfulness_score,
+                    accepted=accepted,
+                    action='stop' if accepted else ('expand-both' if active_cfg['use_evidence_acquisition'] and round_idx < active_cfg['max_rounds'] else None),
+                )
+                rounds.append(round_info)
+
+                if accepted:
+                    print(f'Round {round_idx} accepted')
+                    break
+                if round_idx >= active_cfg['max_rounds']:
+                    break
+                if not active_cfg['use_evidence_acquisition']:
+                    break
+
+                current_seg = expand_span(current_seg, duration, args.boundary_expand_ratio)
+                current_seg = tuple(round_span(current_seg, unit))
+                print(f'Expanded evidence state for next round: {current_seg}')
+
+            final_round = choose_final_round(rounds, active_cfg['selection_rule'])
+            dump['evidence_rounds'] = rounds if args.save_round_details or True else None
+            dump['feedback_rounds'] = dump['evidence_rounds']  # backward-compatible alias
+            dump['executed_rounds'] = len(rounds)
+            dump['accepted_round'] = accepted_round
+            dump['selected_round'] = final_round['round'] if final_round is not None else None
+            dump['selected_span'] = final_round['span'] if final_round is not None else None
+            dump['selected_evidence_state'] = final_round['evidence_state'] if final_round is not None else None
+            dump['final_answer_text'] = final_round['answer_text'] if final_round is not None else ''
+            dump['response'] = final_round['response'] if final_round is not None else ''
+            dump['answerer_response'] = dump['response']
+            dump['reverse_question'] = final_round['reverse_question'] if final_round is not None else None
+            dump['faithfulness_score'] = final_round['faithfulness_score'] if final_round is not None else None
+            dump['overlap'] = dump['faithfulness_score']
+            dump['evidence_sufficient'] = accepted_round is not None
+        dumps.append(dump)
+
+    nncore.dump(dumps, pred_path)
