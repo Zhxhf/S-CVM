@@ -1,0 +1,50 @@
+nohup: ignoring input
+WARNING: All log messages before absl::InitializeLog() is called are written to STDERR
+I0000 00:00:1777486236.159427 3031099 port.cc:153] oneDNN custom operations are on. You may see slightly different numerical results due to floating-point round-off errors from different computation orders. To turn them off, set the environment variable `TF_ENABLE_ONEDNN_OPTS=0`.
+I0000 00:00:1777486236.191090 3031099 cpu_feature_guard.cc:227] This TensorFlow binary is optimized to use available CPU instructions in performance-critical operations.
+To enable the following instructions: AVX2 AVX_VNNI FMA, in other operations, rebuild TensorFlow with the appropriate compiler flags.
+WARNING: All log messages before absl::InitializeLog() is called are written to STDERR
+I0000 00:00:1777486237.518805 3031099 port.cc:153] oneDNN custom operations are on. You may see slightly different numerical results due to floating-point round-off errors from different computation orders. To turn them off, set the environment variable `TF_ENABLE_ONEDNN_OPTS=0`.
+Dataset: nextqa(valid) Chunk: 1 Index: 0 Output Path: outputs_2b_active/nextqa_valid_final_best_rerun/output.json
+Active-Evidence Config: {
+  "variant": "full",
+  "use_sufficiency_estimation": true,
+  "use_faithfulness_acceptance": true,
+  "use_evidence_acquisition": true,
+  "use_candidate_pool": true,
+  "use_candidate_switch": true,
+  "use_merge_two_segments": true,
+  "use_feedback_policy": true,
+  "selection_rule": "best_faithfulness",
+  "max_rounds": 2
+}
+Initializing role *grounder*
+Loading base model from /home/ubuntu/videomind/VideoMind/model_zoo/Qwen2-VL-2B-Instruct...
+Traceback (most recent call last):
+  File "/home/ubuntu/miniconda3/envs/uav/lib/python3.11/site-packages/transformers/utils/hub.py", line 403, in cached_file
+    resolved_file = hf_hub_download(
+                    ^^^^^^^^^^^^^^^^
+  File "/home/ubuntu/miniconda3/envs/uav/lib/python3.11/site-packages/huggingface_hub/utils/_validators.py", line 106, in _inner_fn
+    validate_repo_id(arg_value)
+  File "/home/ubuntu/miniconda3/envs/uav/lib/python3.11/site-packages/huggingface_hub/utils/_validators.py", line 154, in validate_repo_id
+    raise HFValidationError(
+huggingface_hub.errors.HFValidationError: Repo id must be in the form 'repo_name' or 'namespace/repo_name': '/home/ubuntu/videomind/VideoMind/model_zoo/Qwen2-VL-2B-Instruct'. Use `repo_type` argument if needed.
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "/home/ubuntu/videomind/VideoMind/VideoMind-xinG3/videomind/eval/infer_auto.py", line 748, in <module>
+    model, processor = build_model(args.model_gnd_path, device=args.device)
+                       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/ubuntu/videomind/VideoMind/VideoMind-xinG3/videomind/model/builder.py", line 40, in build_model
+    model = AutoModel.from_pretrained(
+            ^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/ubuntu/miniconda3/envs/uav/lib/python3.11/site-packages/transformers/models/auto/auto_factory.py", line 505, in from_pretrained
+    maybe_adapter_path = find_adapter_config_file(
+                         ^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/ubuntu/miniconda3/envs/uav/lib/python3.11/site-packages/transformers/utils/peft_utils.py", line 88, in find_adapter_config_file
+    adapter_cached_filename = cached_file(
+                              ^^^^^^^^^^^^
+  File "/home/ubuntu/miniconda3/envs/uav/lib/python3.11/site-packages/transformers/utils/hub.py", line 469, in cached_file
+    raise EnvironmentError(
+OSError: Incorrect path_or_model_id: '/home/ubuntu/videomind/VideoMind/model_zoo/Qwen2-VL-2B-Instruct'. Please provide either the path to a local folder or the repo_id of a model on the Hub.
